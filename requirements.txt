@@ -1,2 +1,6 @@
-taichi
 numpy
+torch
+matplotlib
+smplx
+tqdm
+Pillow

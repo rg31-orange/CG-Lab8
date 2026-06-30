@@ -1,5 +1,4 @@
 import taichi as ti
-import math
 
 
 # ============================================================
@@ -32,9 +31,7 @@ enable_bending = ti.field(dtype=ti.i32, shape=())
 enable_collision = ti.field(dtype=ti.i32, shape=())
 
 # Collision sphere
-# Important:
-# scene.particles() requires a 1D field, not a 0D scalar field.
-# Therefore sphere_center uses shape=1 instead of shape=().
+# scene.particles() requires a 1D field, so shape=1.
 sphere_center = ti.Vector.field(3, dtype=ti.f32, shape=1)
 sphere_radius = ti.field(dtype=ti.f32, shape=())
 
@@ -50,10 +47,6 @@ v_next = ti.Vector.field(3, dtype=ti.f32, shape=NUM_PARTICLES)
 f_next = ti.Vector.field(3, dtype=ti.f32, shape=NUM_PARTICLES)
 
 # Spring data
-# Structural: about 2N(N-1)
-# Shear: about 2(N-1)^2
-# Bending: about 2N(N-2)
-# Allocate enough capacity.
 MAX_SPRINGS = N * N * 8
 
 spring_pairs = ti.Vector.field(2, dtype=ti.i32, shape=MAX_SPRINGS)
@@ -79,8 +72,10 @@ def init_global_params():
     enable_bending[None] = 1
     enable_collision[None] = 1
 
-    sphere_center[0] = ti.Vector([0.0, 0.08, 0.0])
-    sphere_radius[None] = 0.23
+    # Lower and slightly shrink the sphere.
+    # This makes the cloth visually fall onto the sphere instead of being hidden by it.
+    sphere_center[0] = ti.Vector([0.0, -0.08, 0.0])
+    sphere_radius[None] = 0.20
 
 
 @ti.kernel
@@ -111,6 +106,7 @@ def init_positions():
 @ti.func
 def add_spring(a: ti.i32, b: ti.i32, t: ti.i32):
     c = ti.atomic_add(num_springs[None], 1)
+
     if c < MAX_SPRINGS:
         spring_pairs[c] = ti.Vector([a, b])
         spring_lengths[c] = (x[a] - x[b]).norm()
@@ -121,7 +117,7 @@ def add_spring(a: ti.i32, b: ti.i32, t: ti.i32):
 def init_structural_springs():
     """
     Structural springs:
-    horizontal and vertical neighbors.
+    connect horizontal and vertical neighbors.
     spring_type = 0
     """
     for i, j in ti.ndrange(N, N):
@@ -140,12 +136,13 @@ def init_structural_springs():
 def init_shear_springs():
     """
     Shear springs:
-    diagonal neighbors.
+    connect diagonal neighbors.
     spring_type = 1
     """
     for i, j in ti.ndrange(N - 1, N - 1):
         idx = i * N + j
         idx_right_down = (i + 1) * N + (j + 1)
+
         idx_right = (i + 1) * N + j
         idx_down = i * N + (j + 1)
 
@@ -157,7 +154,7 @@ def init_shear_springs():
 def init_bending_springs():
     """
     Bending springs:
-    connect particles two steps away.
+    connect particles two grid units apart.
     spring_type = 2
     """
     for i, j in ti.ndrange(N, N):
@@ -207,9 +204,7 @@ def init_cloth():
 @ti.func
 def get_spring_stiffness(t: ti.i32) -> ti.f32:
     """
-    Different spring types can use different stiffness.
-    Structural springs are strongest, shear springs medium,
-    bending springs softer.
+    Use different stiffness for different spring types.
     """
     stiffness = k_s[None]
 
@@ -224,10 +219,10 @@ def get_spring_stiffness(t: ti.i32) -> ti.f32:
 @ti.func
 def compute_forces_on(pos: ti.template(), vel: ti.template(), force: ti.template()):
     """
-    Compute gravity, damping and spring force.
+    Compute gravity, damping and spring forces.
     This function is inlined into kernels by ti.func.
     """
-    # Clear force and apply external force.
+    # Clear force and apply gravity + damping.
     for i in range(NUM_PARTICLES):
         force[i] = gravity * mass - k_d[None] * vel[i]
 
@@ -268,7 +263,7 @@ def clamp_velocity(vel: ti.template(), idx: ti.i32):
 def solve_sphere_collision(pos: ti.template(), vel: ti.template(), idx: ti.i32):
     """
     Simple particle-sphere collision.
-    If a particle is inside the sphere, project it to the surface
+    If a particle enters the sphere, project it to the surface
     and remove inward velocity component.
     """
     if enable_collision[None] == 1 and is_fixed[idx] == 0:
@@ -490,28 +485,29 @@ def main():
         scene.point_light(pos=(-0.8, 1.2, 0.8), color=(0.6, 0.6, 0.7))
 
         # Draw collision sphere.
-        # sphere_center is now a 1D vector field with shape=1,
-        # so scene.particles can render it correctly.
+        # The color is darker to avoid visually covering the blue cloth too much.
         if enable_collision[None] == 1:
             scene.particles(
                 sphere_center,
                 radius=sphere_radius[None],
-                color=(0.9, 0.45, 0.25),
+                color=(0.75, 0.35, 0.20),
             )
 
         # Draw cloth particles.
+        # Larger blue particles make the cloth visually clearer in GIF.
         scene.particles(
             x,
-            radius=0.010,
-            color=(0.15, 0.55, 1.0),
+            radius=0.014,
+            color=(0.05, 0.45, 1.0),
         )
 
         # Draw spring lines.
+        # Brighter and thicker lines make the cloth grid easier to observe.
         scene.lines(
             x,
             indices=spring_indices,
-            width=1.2,
-            color=(0.82, 0.82, 0.82),
+            width=1.8,
+            color=(0.95, 0.95, 0.95),
         )
 
         canvas.scene(scene)

@@ -1,4 +1,4 @@
-# Python
+# Python cache
 __pycache__/
 *.py[cod]
 *.pyo
@@ -9,26 +9,32 @@ __pycache__/
 venv/
 env/
 ENV/
-conda-meta/
 
-# IDE
-.vscode/
-.idea/
+# Jupyter
+.ipynb_checkpoints/
 
-# OS
+# OS files
 .DS_Store
 Thumbs.db
 
-# Taichi cache
-.taichi/
-.ti_cache/
-offline_cache/
+# IDE files
+.vscode/
+.idea/
 
-# Video raw files
+# Logs
+*.log
+
+# Large model files / SMPL models
+models/**/*.pkl
+models/**/*.npz
+models/**/*.pt
+models/**/*.pth
+
+# Optional large videos
 *.mp4
 *.avi
 *.mov
-*.mkv
 
-# Keep GIF assets
-!assets/*.gif
+# Temporary files
+tmp/
+temp/
