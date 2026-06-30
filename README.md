@@ -1,331 +1,493 @@
-# 计算机图形学实验七：质点弹簧模型
+# 计算机图形学实验八：LBS 蒙皮
 
-## 一、实验名称
+## 1. 实验名称
 
-**质点弹簧模型：基于 Taichi GGUI 的三维布料模拟**
+**实验八：LBS 蒙皮**
 
----
-
-## 二、实验目标
-
-本实验使用 Taichi 框架实现了一个三维质点-弹簧布料模拟系统。实验主要目标如下：
-
-1. 掌握基于 Taichi 的动态场景渲染方法；
-2. 使用 Taichi GGUI 构建交互式三维可视化窗口；
-3. 理解质点-弹簧模型中的弹力、阻尼力和重力计算；
-4. 实现显式欧拉、半隐式欧拉和隐式欧拉三种数值积分方法；
-5. 对比不同积分方法在稳定性方面的差异；
-6. 使用速度钳制防止数值爆炸；
-7. 使用 `ti.kernel` 和 `ti.func` 组织 GPU 并行计算；
-8. 完成剪切弹簧、弯曲弹簧和球体碰撞等选做内容。
+本实验基于 **SMPL 参数化人体模型**，完成一次完整的 **Linear Blend Skinning, LBS** 蒙皮过程可视化。实验通过手写复现 SMPL 官方 `lbs()` 中的关键计算流程，提取并可视化模板网格、形状校正、姿态校正、线性混合蒙皮等中间结果。
 
 ---
 
-## 三、项目结构
+## 2. 实验目标
+
+本实验的主要目标如下：
+
+1. 理解参数化人体模型中模板网格、形状参数、姿态参数、关节回归器和蒙皮权重之间的关系。
+2. 理解 LBS 的四个主要阶段：
+   - **(a)** 模板网格 $$\bar{T}$$ 与蒙皮权重 $$\mathcal{W}$$；
+   - **(b)** 形状校正后网格 $$\bar{T} + B_S(\beta)$$ 以及关节 $$J(\beta)$$；
+   - **(c)** 姿态校正后网格 $$T_P(\beta,\theta)=\bar{T}+B_S(\beta)+B_P(\theta)$$；
+   - **(d)** 经过 LBS 之后的最终姿态结果。
+3. 学会调用 SMPL 模型，并将官方 `lbs()` 实现中的关键中间量单独提取出来进行可视化。
+4. 验证手写 LBS 计算结果与 SMPL 官方 forward 输出结果的一致性。
+
+---
+
+## 3. 项目结构
 
 ```text
-CG-Lab7/
-│
-├─ README.md
-├─ requirements.txt
-├─ .gitignore
-│
-├─ src/
-│  └─ main.py
-│
-└─ assets/
-   ├─ a.gif
-   ├─ b.gif
-   ├─ c.gif
-
+lab8_lbs_skinning/
+├── README.md
+├── requirements.txt
+├── .gitignore
+├── src/
+│   └── lab8_lbs.py
+├── models/
+│   └── smpl/
+│       └── SMPL_NEUTRAL.pkl
+└── outputs/
+    ├── stage_a_template_weights.png
+    ├── stage_b_shaped_joints.png
+    ├── stage_c_pose_offsets.png
+    ├── stage_d_lbs_result.png
+    ├── comparison_grid.png
+    ├── all_joint_weights.png
+    └── summary.txt
 ```
+
+其中：
+
+| 文件或目录 | 说明 |
+|---|---|
+| `src/lab8_lbs.py` | 实验八主程序，包含手写 LBS、可视化和误差验证 |
+| `models/smpl/SMPL_NEUTRAL.pkl` | SMPL 中性人体模型文件，需要自行下载并放置 |
+| `outputs/` | 程序运行后生成的实验结果图片与摘要文件 |
+| `outputs/stage_a_template_weights.png` | 模板网格与单关节蒙皮权重热力图 |
+| `outputs/stage_b_shaped_joints.png` | 形状校正后的网格与回归关节 |
+| `outputs/stage_c_pose_offsets.png` | 姿态校正偏移量可视化 |
+| `outputs/stage_d_lbs_result.png` | 最终 LBS 蒙皮结果 |
+| `outputs/comparison_grid.png` | 四个阶段总对比图 |
+| `outputs/all_joint_weights.png` | 全关节主导权重分布图 |
+| `outputs/summary.txt` | 模型基础信息与手写 LBS 误差验证结果 |
+| `requirements.txt` | Python 依赖列表 |
+| `.gitignore` | 忽略虚拟环境、缓存、模型文件等不应提交的内容 |
 
 ---
 
-## 四、环境配置
+## 4. 实验环境
 
-### 1. 创建环境
+本实验使用以下环境：
+
+- Python 3.10 或以上
+- PyTorch
+- NumPy
+- Matplotlib
+- smplx
+
+推荐使用虚拟环境运行：
 
 ```bash
-conda create -n cg-lab7 python=3.10 -y
-conda activate cg-lab7
+python -m venv .venv
+source .venv/bin/activate
 ```
 
-### 2. 安装依赖
+Windows PowerShell 下可以使用：
+
+```powershell
+python -m venv .venv
+.venv\Scripts\activate
+```
+
+然后安装依赖：
 
 ```bash
 pip install -r requirements.txt
 ```
 
-如果网络较慢，可以使用清华镜像源：
+---
 
-```bash
-pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
+## 5. SMPL 模型文件准备
+
+本实验需要使用 SMPL 模型文件：
+
+```text
+SMPL_NEUTRAL.pkl
+```
+
+请将模型文件放置到：
+
+```text
+models/smpl/SMPL_NEUTRAL.pkl
+```
+
+注意：SMPL 模型文件通常受协议限制，**不建议直接上传到公开 GitHub 仓库**。本仓库通过 `.gitignore` 忽略该文件，使用者需要自行下载并放入对应目录。
+
+模型目录应类似：
+
+```text
+models/
+└── smpl/
+    └── SMPL_NEUTRAL.pkl
 ```
 
 ---
 
-## 五、运行方式
+## 6. 实验原理
+
+### 6.1 LBS 基本思想
+
+LBS，即 Linear Blend Skinning，线性混合蒙皮，是计算机图形学和三维人体建模中常用的骨骼驱动网格变形方法。
+
+对于一个顶点 $$v_i$$，它并不是只受一个关节控制，而是同时受到多个关节的影响。最终顶点位置由多个关节变换矩阵按照蒙皮权重加权得到：
+
+$$
+v_i' = \sum_{k=1}^{K} w_{ik} \, G_k(\theta, J(\beta)) \begin{bmatrix} v_i^{posed} \\ 1 \end{bmatrix}
+$$
+
+其中：
+
+- $$v_i'$$ 是最终蒙皮后的顶点；
+- $$w_{ik}$$ 是第 $$i$$ 个顶点受第 $$k$$ 个关节影响的权重；
+- $$G_k$$ 是第 $$k$$ 个关节的全局刚体变换；
+- $$v_i^{posed}$$ 是经过形状校正和姿态校正后的顶点；
+- $$K$$ 是关节数量。
+
+---
+
+### 6.2 阶段一：模板网格与蒙皮权重
+
+SMPL 模型的初始网格为模板人体网格：
+
+$$
+\bar{T}
+$$
+
+通常处于 T-pose 状态。每个顶点还带有一组蒙皮权重：
+
+$$
+\mathcal{W}
+$$
+
+蒙皮权重描述该顶点受到各个关节影响的程度。靠近手臂的顶点通常更多受到肩、肘、腕等关节影响；靠近腿部的顶点则更多受到髋、膝、踝等关节影响。
+
+在代码中对应：
+
+```python
+v_template = model.v_template
+lbs_weights = model.lbs_weights
+```
+
+---
+
+### 6.3 阶段二：形状校正与关节回归
+
+SMPL 使用形状参数 $$\beta$$ 控制人体体型，例如高矮、胖瘦、肩宽、腿长等。形状校正后的顶点为：
+
+$$
+T_{shape} = \bar{T} + B_S(\beta)
+$$
+
+代码中对应：
+
+```python
+v_shaped = v_template + blend_shapes(betas, shapedirs)
+```
+
+关节位置并不是固定常数，而是由形状变化后的网格通过关节回归器得到：
+
+$$
+J(\beta) = \mathcal{J}(T_{shape})
+$$
+
+代码中对应：
+
+```python
+J = vertices2joints(model.J_regressor, v_shaped)
+```
+
+这样可以保证不同体型的人体模型具有合理的关节位置。
+
+---
+
+### 6.4 阶段三：姿态校正
+
+仅使用骨骼旋转对网格进行刚体变换，容易在肩膀、肘部、膝盖等弯曲区域产生不自然的变形。因此 SMPL 在真正进行 LBS 之前，会添加姿态相关校正项：
+
+$$
+T_P(\beta,\theta) = \bar{T}+B_S(\beta)+B_P(\theta)
+$$
+
+具体做法是先将轴角姿态转换为旋转矩阵，然后构造姿态特征：
+
+$$
+pose\_feature = R(\theta) - I
+$$
+
+再通过 `posedirs` 得到姿态偏移：
+
+```python
+rot_mats = batch_rodrigues(full_pose.view(-1, 3)).view(1, -1, 3, 3)
+pose_feature = (rot_mats[:, 1:, :, :] - ident).view(1, -1)
+pose_offsets = torch.matmul(pose_feature, posedirs).view(1, -1, 3)
+v_posed = v_shaped + pose_offsets
+```
+
+这一步得到的 `v_posed` 仍然不是最终姿态，只是加入了姿态相关的局部几何修正。
+
+---
+
+### 6.5 阶段四：线性混合蒙皮
+
+在最终 LBS 阶段，需要根据运动学树计算每个关节的全局刚体变换：
+
+```python
+J_transformed, A = batch_rigid_transform(rot_mats, J, model.parents, dtype=dtype)
+```
+
+然后使用蒙皮权重对关节变换进行加权：
+
+```python
+W = model.lbs_weights.unsqueeze(0).expand(1, -1, -1)
+T = torch.matmul(W, A.view(1, num_joints, 16)).view(1, -1, 4, 4)
+```
+
+最后将加权后的变换作用于姿态校正后的顶点：
+
+```python
+v_posed_homo = torch.cat([v_posed, homogen_coord], dim=2)
+v_homo = torch.matmul(T, v_posed_homo.unsqueeze(-1))
+verts = v_homo[:, :, :3, 0]
+```
+
+其中 `verts` 就是最终完成 LBS 之后的人体网格顶点。
+
+---
+
+## 7. 核心变量说明
+
+本实验在代码中明确区分以下五个核心对象：
+
+| 变量 | 含义 |
+|---|---|
+| `v_template` | SMPL 模板网格顶点，通常为 T-pose |
+| `v_shaped` | 加入形状参数后的顶点 |
+| `J` / `J_shaped` | 由 `v_shaped` 通过关节回归器得到的关节 |
+| `v_posed` | 加入姿态校正项后的顶点 |
+| `verts` | 完成 LBS 后的最终顶点 |
+
+这五个变量对应 LBS 从模板网格到最终姿态结果的完整流程。
+
+---
+
+## 8. 运行方式
+
+### 8.1 安装依赖
+
+```bash
+pip install -r requirements.txt
+```
+
+### 8.2 放置模型文件
+
+将 `SMPL_NEUTRAL.pkl` 放入：
+
+```text
+models/smpl/SMPL_NEUTRAL.pkl
+```
+
+### 8.3 运行实验
 
 在项目根目录下执行：
 
 ```bash
-python src/main.py
+python src/lab8_lbs.py --model-dir ./models --out-dir ./outputs --joint-id 18 --num-betas 10
 ```
 
-运行后会打开 Taichi GGUI 三维窗口。
+参数说明：
 
-鼠标操作：
+| 参数 | 默认值 | 说明 |
+|---|---|---|
+| `--model-dir` | `./models` | SMPL 模型所在目录 |
+| `--out-dir` | `./outputs` | 输出结果目录 |
+| `--joint-id` | `18` | 单关节权重热力图中要可视化的关节编号 |
+| `--num-betas` | `10` | 使用的 shape 参数数量 |
 
-- 鼠标右键拖动：旋转相机；
-- 鼠标滚轮：缩放视角；
-- 控制面板按钮：切换积分方法、暂停、重置、切换弹簧类型和碰撞。
-
----
-
-## 六、实验原理
-
-### 6.1 质点-弹簧模型
-
-质点-弹簧模型是计算机图形学中常用的变形体模拟方法。布料被离散为规则网格上的质点，相邻质点之间通过弹簧连接。
-
-对于两个质点 $$a$$ 和 $$b$$，它们之间的弹簧力由胡克定律给出：
-
-$$f_a = -k_s (|x_a - x_b| - l) \frac{x_a - x_b}{|x_a - x_b|}$$
-
-其中：
-
-- $$k_s$$ 为弹簧劲度系数；
-- $$x_a$$ 和 $$x_b$$ 为两个质点的位置；
-- $$l$$ 为弹簧原长；
-- $$|x_a - x_b|$$ 为当前弹簧长度。
-
-为了抑制系统能量不断增加，本实验加入阻尼力：
-
-$$f_d = -k_d v$$
-
-其中 $$k_d$$ 为阻尼系数，$$v$$ 为质点速度。
-
-质点最终受到的合力包括：
-
-$$F = F_{gravity} + F_{damping} + F_{spring}$$
+运行成功后，会在 `outputs/` 下生成所有实验结果。
 
 ---
 
-### 6.2 弹簧类型
+## 9. 实验结果展示
 
-本实验实现了三类弹簧。
+### 9.1 阶段一：模板网格与蒙皮权重
 
-#### 6.2.1 结构弹簧 Structural Spring
+该图展示了 SMPL 模板人体网格，以及指定关节对所有顶点的影响权重。颜色越明显，表示该关节对该区域的影响越强。
 
-结构弹簧连接上下左右相邻质点，用于维持布料基本网格结构。
-
-#### 6.2.2 剪切弹簧 Shear Spring
-
-剪切弹簧连接对角线方向的质点，用于抵抗布料的剪切变形。
-
-#### 6.2.3 弯曲弹簧 Bending Spring
-
-弯曲弹簧连接相隔两个网格单位的质点，用于增强布料的抗弯曲能力，使布料表面更加平滑稳定。
+![模板网格与蒙皮权重](./outputs/stage_a_template_weights.png)
 
 ---
 
-### 6.3 数值积分方法
+### 9.2 全关节主导权重分布图
 
-根据牛顿第二定律：
+该图展示了人体表面不同区域主要由哪些关节控制。每个面片根据主导影响关节分配颜色，颜色种类表示主导关节，颜色强弱表示主导权重大小。
 
-$$a = \frac{F}{m}$$
-
-在离散时间步 $$\Delta t$$ 内，需要使用数值积分方法更新速度和位置。
+![全关节主导权重分布图](./outputs/all_joint_weights.png)
 
 ---
 
-#### 6.3.1 显式欧拉 Explicit Euler
+### 9.3 阶段二：形状校正与关节回归
 
-显式欧拉完全使用当前时刻的状态更新下一时刻：
+该图展示了加入非零 shape 参数后的 `v_shaped` 网格，并叠加显示由关节回归器计算出的关节点。
 
-$$x_{t+1} = x_t + v_t \Delta t$$
+![形状校正与关节回归](./outputs/stage_b_shaped_joints.png)
 
-$$v_{t+1} = v_t + a_t \Delta t$$
-
-显式欧拉实现简单，但稳定性较差。当弹簧劲度较大或时间步较大时，容易发生数值爆炸。
+从结果可以看出，人体体型发生变化后，关节点仍然位于身体内部较合理的位置。这说明 SMPL 的关节位置与人体形状相关，而不是固定不变的常数。
 
 ---
 
-#### 6.3.2 半隐式欧拉 Semi-Implicit Euler
+### 9.4 阶段三：姿态校正可视化
 
-半隐式欧拉先更新速度，再使用更新后的速度更新位置：
+该图展示了姿态校正偏移量 `pose_offsets` 的大小。颜色越明显，说明该区域受到姿态相关校正的影响越大。
 
-$$v_{t+1} = v_t + a_t \Delta t$$
+![姿态校正偏移量](./outputs/stage_c_pose_offsets.png)
 
-$$x_{t+1} = x_t + v_{t+1} \Delta t$$
-
-相比显式欧拉，半隐式欧拉在物理模拟中更加稳定，适合实时布料模拟。
+姿态校正主要出现在肩膀、肘部、髋部、膝盖等容易发生弯曲的区域。
 
 ---
 
-#### 6.3.3 隐式欧拉 Implicit Euler
+### 9.5 阶段四：最终 LBS 蒙皮结果
 
-隐式欧拉使用未来时刻的状态计算加速度：
+该图展示了经过 LBS 后的最终人体姿态，同时叠加显示变换后的关节点。
 
-$$v_{t+1} = v_t + a_{t+1} \Delta t$$
+![最终 LBS 结果](./outputs/stage_d_lbs_result.png)
 
-$$x_{t+1} = x_t + v_{t+1} \Delta t$$
-
-由于未来状态未知，本实验使用定点迭代法近似求解隐式欧拉。隐式欧拉具有更强的数值稳定性，但计算量更大，并且阻尼效果更加明显。
+最终结果表明，人体网格已经根据给定姿态参数完成了骨骼驱动变形。
 
 ---
 
-### 6.4 速度钳制
+### 9.6 四阶段总对比图
 
-为了避免显式欧拉等方法在不稳定情况下产生过大速度，本实验实现了速度钳制：
+下图将 LBS 的四个阶段放在同一张图中，分别为：
 
-$$v =
-\begin{cases}
-v, & \|v\| \leq v_{max} \\
-\frac{v}{\|v\|}v_{max}, & \|v\| > v_{max}
-\end{cases}
-$$
+- **(a)** template + weights
+- **(b)** shape + joints
+- **(c)** pose offsets
+- **(d)** final skinned mesh
 
-该方法可以限制极端情况下的速度大小，防止布料瞬间飞出场景。
+![四阶段总对比图](./outputs/comparison_grid.png)
 
----
-
-### 6.5 球体碰撞
-
-选做部分中，本实验加入了布料与球体的碰撞检测。
-
-对于质点位置 $$x_i$$ 和球心 $$c$$，若满足：
-
-$$\|x_i - c\| < r$$
-
-则说明质点进入球体内部。此时将质点投影到球体表面：
-
-$$x_i = c + r \frac{x_i - c}{\|x_i - c\|}$$
-
-同时移除朝向球体内部的速度分量，避免质点继续穿透。
+该图可以直观展示从模板网格到最终蒙皮结果的完整变化过程。
 
 ---
 
-## 七、代码实现说明
+## 10. 手写 LBS 与官方 forward 一致性验证
 
-### 7.1 GPU 同步初始化
+实验中使用与手写实现完全相同的：
 
-按照实验要求，本项目将初始化过程拆分为多个 `@ti.kernel`：
+- `betas`
+- `global_orient`
+- `body_pose`
+
+调用官方 SMPL forward：
 
 ```python
-init_positions()
-init_structural_springs()
-init_shear_springs()
-init_bending_springs()
-init_spring_indices()
+output = model(
+    betas=betas,
+    global_orient=global_orient,
+    body_pose=body_pose,
+    return_verts=True,
+)
 ```
 
-并在 Python 侧按顺序调用：
+然后将手写 LBS 得到的 `verts` 与官方输出 `output.vertices` 逐顶点比较，计算：
 
-```python
-def init_cloth():
-    num_springs[None] = 0
-    init_positions()
-    init_structural_springs()
-    init_shear_springs()
-    init_bending_springs()
-    init_spring_indices()
+- 平均绝对误差；
+- 最大绝对误差。
+
+误差结果保存在：
+
+```text
+outputs/summary.txt
 ```
 
-这样可以保证 GPU 上不同阶段的状态同步，避免弹簧初始化时读取到未完成写入的位置数据。
+示例内容如下：
 
----
-
-### 7.2 ti.func 内联函数
-
-本实验将受力计算与速度钳制写成 `@ti.func`：
-
-```python
-@ti.func
-def compute_forces_on(pos, vel, force):
-    ...
-
-@ti.func
-def clamp_velocity(vel, idx):
-    ...
+```text
+===== SMPL LBS Lab Summary =====
+num_vertices: 6890
+num_faces: 13776
+num_joints(from lbs_weights): 24
+num_betas: 10
+visualized_joint_id: 18
+manual_vs_official_mean_abs_error: 0.0000000000
+manual_vs_official_max_abs_error: 0.0000000000
 ```
 
-`ti.func` 会在编译时内联到调用它的 kernel 中，减少函数调用开销，并便于在不同积分方法中复用逻辑。
+若误差接近 0，说明手写 LBS 实现与官方 SMPL forward 结果一致。
 
 ---
 
-### 7.3 三种积分 Kernel
+## 11. 思考题回答
 
-本实验分别实现了三个积分 kernel：
+### 11.1 为什么一个顶点不只受一个关节影响？
 
-```python
-step_explicit()
-step_semi_implicit()
-step_implicit_iter()
-```
-
-每个 kernel 内部都合并了受力计算和状态更新，从而减少每帧模拟过程中的 kernel 启动次数，提高运行效率。
+人体表面是连续的。如果每个顶点只受一个关节控制，那么在关节交界处会出现明显断裂或硬折痕。例如肘部、膝盖、肩部等区域在运动时需要平滑过渡，因此一个顶点通常会同时受到多个关节影响。
 
 ---
 
-### 7.4 GGUI 交互面板
+### 11.2 如果一个顶点的权重几乎全给某一个关节，会出现什么效果？
 
-程序使用 `ti.ui.Window` 创建三维窗口，并通过 `window.GUI` 构建控制面板。控制面板支持：
-
-- 切换显式欧拉；
-- 切换半隐式欧拉；
-- 切换隐式欧拉；
-- 暂停或恢复模拟；
-- 重置布料；
-- 开关剪切弹簧；
-- 开关弯曲弹簧；
-- 开关球体碰撞；
-- 调节阻尼系数；
-- 调节弹簧劲度系数；
-- 调节最大速度。
+如果某个顶点的权重几乎全部集中在一个关节上，那么该顶点会近似刚性地跟随这个关节运动。这种情况适合远离关节弯曲区域的部位，例如前臂中部、小腿中部等。
 
 ---
 
-## 八、实验结果展示
+### 11.3 如果权重分布很平均，会出现什么效果？
 
-### 8.1 半隐式欧拉稳定模拟
-
-半隐式欧拉在当前参数下具有较好的稳定性，布料能够自然下垂并与碰撞球发生交互。
-
-### 8.2 显式欧拉稳定性较差
-
-显式欧拉在弹簧劲度较大时更容易出现震荡。虽然加入了速度钳制，但仍能观察到明显的不稳定趋势。
-
-
-### 8.3 隐式欧拉阻尼效果明显
-
-隐式欧拉通过定点迭代近似求解未来状态，稳定性较强，但整体运动更偏阻尼化。
-
-![Implicit Euler](assets/a.gif)
+如果一个顶点对多个关节的权重过于平均，那么它会受到多个关节变换的混合影响，运动可能变得过于平滑甚至不够稳定。在某些区域可能出现不自然的拉伸或塌陷。
 
 ---
 
-### 8.4 球体碰撞效果
+### 11.4 为什么关节位置要从形状后的网格回归，而不是固定不变？
 
-开启球体碰撞后，布料质点会被约束在球体表面之外，从而形成覆盖球体的布料形态。
-
-![Collision](assets/c.gif)
+不同体型的人体具有不同的骨架比例和关节位置。例如高矮、胖瘦、肩宽、腿长都会影响肩、髋、膝等关节的大致位置。如果关节固定不变，就无法适应不同体型的人体模型，最终蒙皮结果会不自然。
 
 ---
 
-### 8.5 不同弹簧类型对比
+### 11.5 如果人物变胖或变瘦，肩、膝、髋等关节位置会不会变化？
 
-开启剪切弹簧和弯曲弹簧后，布料的整体形态更加稳定，局部折叠和过度拉伸现象减少。
-
-![Spring Compare](assets/b.gif)
+会变化。虽然关节拓扑结构不变，但关节在三维空间中的具体位置会随着人体形状发生调整。因此 SMPL 通过 `J_regressor` 从 `v_shaped` 中回归关节位置。
 
 ---
 
-## 九、实验总结
+### 11.6 `v_template` 与 `v_shaped` 的差别是什么？
 
-本实验实现了一个完整的三维质点-弹簧布料模拟系统。通过 Taichi 的并行计算能力，布料中大量质点与弹簧可以在 GPU 上高效更新。实验中实现了重力、阻尼力、弹簧力和速度钳制，并通过结构弹簧、剪切弹簧和弯曲弹簧构建了较完整的布料模型。
+`v_template` 是 SMPL 的平均模板人体网格，通常表示标准体型。`v_shaped` 是在 `v_template` 基础上加入形状参数 $$\beta$$ 后得到的网格，体现了具体人物的体型差异。
 
-在数值积分方面，实验对比了显式欧拉、半隐式欧拉和隐式欧拉三种方法。显式欧拉实现简单但稳定性较差；半隐式欧拉在实时模拟中表现较好；隐式欧拉稳定性更强，但计算量更大，且表现出更明显的阻尼特征。
+---
 
-此外，本实验完成了球体碰撞选做内容，使布料能够与场景中的几何体发生简单交互。通过 GGUI 控制面板，可以实时切换积分方法、调节物理参数并观察不同模型设置下的动态效果。
+### 11.7 为什么 LBS 之前还要加 pose corrective？
+
+单纯使用骨骼刚体变换很难表达人体关节弯曲时产生的局部肌肉和皮肤变化。例如肩部抬起、肘部弯曲、膝盖弯曲时，皮肤表面会发生额外形变。pose corrective 可以补偿这些非刚体变化，使结果更自然。
+
+---
+
+### 11.8 如果去掉 `pose_offsets`，最终人体弯曲处会出现什么问题？
+
+如果去掉 `pose_offsets`，肩膀、肘部、膝盖等区域可能出现塌陷、穿插、异常拉伸或体积损失等问题。最终人体姿态会显得比较僵硬，不够真实。
+
+---
+
+### 11.9 `v_shaped` 与 `v_posed` 的本质区别是什么？
+
+`v_shaped` 只包含人体体型变化，由 shape 参数 $$\beta$$ 控制。`v_posed` 在 `v_shaped` 的基础上进一步加入了姿态相关校正 $$B_P(\theta)$$，用于修正特定姿态下的局部几何变化。
+
+---
+
+### 11.10 `J` 和 `J_transformed` 有什么区别？
+
+`J` 是根据 `v_shaped` 回归得到的关节位置，通常处于未经过姿态变换的形状空间中。`J_transformed` 是经过运动学链和姿态变换后的关节位置，表示最终姿态下的关节点位置。
+
+---
+
+### 11.11 为什么最终顶点要写成加权和，而不是只选择最大权重的关节？
+
+如果只选择最大权重的关节，人体表面会产生分段刚性变形，关节连接区域会出现明显断裂或折痕。使用加权和可以让相邻骨骼之间平滑过渡，使皮肤变形更加连续自然。
+
+---
+
+## 12. 实验总结
+
+本实验基于 SMPL 模型完整实现并可视化了 LBS 蒙皮流程。实验从模板网格出发，依次完成了蒙皮权重可视化、形状校正、关节回归、姿态校正和最终线性混合蒙皮。
+
+通过本实验可以更加清楚地理解 SMPL 模型中模板网格、形状参数、姿态参数、关节回归器、姿态修正项和蒙皮权重之间的关系。同时，通过将手写 LBS 结果与官方 forward 输出进行误差比较，也验证了实验实现的正确性。
+
+本实验为后续学习三维人体建模、骨骼动画、角色绑定、人体姿态估计和神经人体渲染等内容打下了基础。

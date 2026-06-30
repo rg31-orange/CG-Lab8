@@ -1,518 +1,814 @@
-import taichi as ti
+import os
+import argparse
+import sys
+import types
+import numpy as np
+import torch
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+
+import smplx
+from smplx.lbs import (
+    blend_shapes,
+    vertices2joints,
+    batch_rodrigues,
+    batch_rigid_transform,
+)
 
 
 # ============================================================
-# Taichi Initialization
+# Path settings
 # ============================================================
 
-ti.init(arch=ti.gpu)
-
-
-# ============================================================
-# Global Parameters
-# ============================================================
-
-N = 24
-NUM_PARTICLES = N * N
-
-mass = 1.0
-dt = 5e-4
-
-gravity = ti.Vector([0.0, -9.8, 0.0])
-
-# Spring parameters
-k_s = ti.field(dtype=ti.f32, shape=())
-k_d = ti.field(dtype=ti.f32, shape=())
-max_velocity = ti.field(dtype=ti.f32, shape=())
-
-# Simulation switches
-enable_shear = ti.field(dtype=ti.i32, shape=())
-enable_bending = ti.field(dtype=ti.i32, shape=())
-enable_collision = ti.field(dtype=ti.i32, shape=())
-
-# Collision sphere
-# scene.particles() requires a 1D field, so shape=1.
-sphere_center = ti.Vector.field(3, dtype=ti.f32, shape=1)
-sphere_radius = ti.field(dtype=ti.f32, shape=())
-
-# Cloth fields
-x = ti.Vector.field(3, dtype=ti.f32, shape=NUM_PARTICLES)
-v = ti.Vector.field(3, dtype=ti.f32, shape=NUM_PARTICLES)
-f = ti.Vector.field(3, dtype=ti.f32, shape=NUM_PARTICLES)
-is_fixed = ti.field(dtype=ti.i32, shape=NUM_PARTICLES)
-
-# Implicit Euler temporary fields
-x_next = ti.Vector.field(3, dtype=ti.f32, shape=NUM_PARTICLES)
-v_next = ti.Vector.field(3, dtype=ti.f32, shape=NUM_PARTICLES)
-f_next = ti.Vector.field(3, dtype=ti.f32, shape=NUM_PARTICLES)
-
-# Spring data
-MAX_SPRINGS = N * N * 8
-
-spring_pairs = ti.Vector.field(2, dtype=ti.i32, shape=MAX_SPRINGS)
-spring_lengths = ti.field(dtype=ti.f32, shape=MAX_SPRINGS)
-spring_type = ti.field(dtype=ti.i32, shape=MAX_SPRINGS)
-num_springs = ti.field(dtype=ti.i32, shape=())
-
-# Rendering indices for scene.lines
-spring_indices = ti.field(dtype=ti.i32, shape=MAX_SPRINGS * 2)
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
 
 
 # ============================================================
-# Initialization Kernels
+# Chumpy compatibility shim
 # ============================================================
 
-@ti.kernel
-def init_global_params():
-    k_s[None] = 8000.0
-    k_d[None] = 1.0
-    max_velocity[None] = 50.0
-
-    enable_shear[None] = 1
-    enable_bending[None] = 1
-    enable_collision[None] = 1
-
-    # Lower and slightly shrink the sphere.
-    # This makes the cloth visually fall onto the sphere instead of being hidden by it.
-    sphere_center[0] = ti.Vector([0.0, -0.08, 0.0])
-    sphere_radius[None] = 0.20
-
-
-@ti.kernel
-def init_positions():
+class _ChumpyArrayShim:
     """
-    Initialize particle positions and fixed constraints.
-    The cloth is placed in the XZ plane and falls along Y axis.
+    Minimal pickle shim for old SMPL files that stored arrays as chumpy.Ch.
+
+    Some old SMPL .pkl files depend on chumpy. If chumpy is not installed,
+    pickle loading may fail. This shim lets pickle recover array data without
+    installing the full chumpy package.
     """
-    for i, j in ti.ndrange(N, N):
-        idx = i * N + j
 
-        spacing = 1.0 / (N - 1)
-        px = i * spacing - 0.5
-        py = 0.75
-        pz = j * spacing - 0.5
+    def __setstate__(self, state):
+        self.__dict__.update(state)
 
-        x[idx] = ti.Vector([px, py, pz])
-        v[idx] = ti.Vector([0.0, 0.0, 0.0])
-        f[idx] = ti.Vector([0.0, 0.0, 0.0])
+    def _array(self):
+        if hasattr(self, "r"):
+            return self.r
+        if hasattr(self, "x"):
+            return self.x
+        raise AttributeError("Cannot recover array data from chumpy pickle object")
 
-        # Fix two top corners.
-        if j == 0 and (i == 0 or i == N - 1):
-            is_fixed[idx] = 1
-        else:
-            is_fixed[idx] = 0
+    def __array__(self, dtype=None):
+        return np.asarray(self._array(), dtype=dtype)
 
+    @property
+    def shape(self):
+        return np.asarray(self).shape
 
-@ti.func
-def add_spring(a: ti.i32, b: ti.i32, t: ti.i32):
-    c = ti.atomic_add(num_springs[None], 1)
+    def __len__(self):
+        return len(np.asarray(self))
 
-    if c < MAX_SPRINGS:
-        spring_pairs[c] = ti.Vector([a, b])
-        spring_lengths[c] = (x[a] - x[b]).norm()
-        spring_type[c] = t
+    def __getitem__(self, item):
+        return np.asarray(self)[item]
 
 
-@ti.kernel
-def init_structural_springs():
+def install_chumpy_pickle_shim():
     """
-    Structural springs:
-    connect horizontal and vertical neighbors.
-    spring_type = 0
+    Allow pickle.load to read legacy SMPL .pkl files without installing chumpy.
     """
-    for i, j in ti.ndrange(N, N):
-        idx = i * N + j
+    if "chumpy.ch" in sys.modules:
+        return
 
-        if i < N - 1:
-            idx_right = (i + 1) * N + j
-            add_spring(idx, idx_right, 0)
+    chumpy_module = types.ModuleType("chumpy")
+    chumpy_ch_module = types.ModuleType("chumpy.ch")
 
-        if j < N - 1:
-            idx_down = i * N + (j + 1)
-            add_spring(idx, idx_down, 0)
+    _ChumpyArrayShim.__name__ = "Ch"
+    _ChumpyArrayShim.__qualname__ = "Ch"
+    _ChumpyArrayShim.__module__ = "chumpy.ch"
 
+    chumpy_ch_module.Ch = _ChumpyArrayShim
+    chumpy_module.ch = chumpy_ch_module
 
-@ti.kernel
-def init_shear_springs():
-    """
-    Shear springs:
-    connect diagonal neighbors.
-    spring_type = 1
-    """
-    for i, j in ti.ndrange(N - 1, N - 1):
-        idx = i * N + j
-        idx_right_down = (i + 1) * N + (j + 1)
-
-        idx_right = (i + 1) * N + j
-        idx_down = i * N + (j + 1)
-
-        add_spring(idx, idx_right_down, 1)
-        add_spring(idx_right, idx_down, 1)
-
-
-@ti.kernel
-def init_bending_springs():
-    """
-    Bending springs:
-    connect particles two grid units apart.
-    spring_type = 2
-    """
-    for i, j in ti.ndrange(N, N):
-        idx = i * N + j
-
-        if i < N - 2:
-            idx_far_x = (i + 2) * N + j
-            add_spring(idx, idx_far_x, 2)
-
-        if j < N - 2:
-            idx_far_z = i * N + (j + 2)
-            add_spring(idx, idx_far_z, 2)
-
-
-@ti.kernel
-def init_spring_indices():
-    """
-    Prepare index buffer for GGUI line rendering.
-    """
-    for i in range(num_springs[None]):
-        spring_indices[i * 2] = spring_pairs[i][0]
-        spring_indices[i * 2 + 1] = spring_pairs[i][1]
-
-
-def init_cloth():
-    """
-    Python side sequential kernel calls guarantee GPU synchronization.
-    """
-    num_springs[None] = 0
-
-    init_positions()
-    init_structural_springs()
-
-    if enable_shear[None] == 1:
-        init_shear_springs()
-
-    if enable_bending[None] == 1:
-        init_bending_springs()
-
-    init_spring_indices()
+    sys.modules["chumpy"] = chumpy_module
+    sys.modules["chumpy.ch"] = chumpy_ch_module
 
 
 # ============================================================
-# Physics Functions
+# Utility functions
 # ============================================================
 
-@ti.func
-def get_spring_stiffness(t: ti.i32) -> ti.f32:
+def make_out_dir(path: str):
+    os.makedirs(path, exist_ok=True)
+
+
+def resolve_project_path(path: str):
     """
-    Use different stiffness for different spring types.
+    Resolve relative path with respect to project root.
+
+    Example:
+        ./models  -> lab8_lbs_skinning/models
+        ./outputs -> lab8_lbs_skinning/outputs
     """
-    stiffness = k_s[None]
-
-    if t == 1:
-        stiffness = k_s[None] * 0.75
-    elif t == 2:
-        stiffness = k_s[None] * 0.35
-
-    return stiffness
+    if os.path.isabs(path):
+        return path
+    return os.path.join(PROJECT_ROOT, path)
 
 
-@ti.func
-def compute_forces_on(pos: ti.template(), vel: ti.template(), force: ti.template()):
+def to_numpy(x):
+    if torch.is_tensor(x):
+        return x.detach().cpu().numpy()
+    return np.asarray(x)
+
+
+def set_axes_equal(ax, vertices: np.ndarray):
     """
-    Compute gravity, damping and spring forces.
-    This function is inlined into kernels by ti.func.
+    Make 3D axes have equal scale so the human mesh is not distorted.
     """
-    # Clear force and apply gravity + damping.
-    for i in range(NUM_PARTICLES):
-        force[i] = gravity * mass - k_d[None] * vel[i]
+    mins = vertices.min(axis=0)
+    maxs = vertices.max(axis=0)
+    center = (mins + maxs) / 2.0
+    radius = 0.5 * np.max(maxs - mins + 1e-8)
 
-    # Accumulate spring forces.
-    for s in range(num_springs[None]):
-        idx_a = spring_pairs[s][0]
-        idx_b = spring_pairs[s][1]
-
-        pos_a = pos[idx_a]
-        pos_b = pos[idx_b]
-
-        d = pos_a - pos_b
-        dist = d.norm()
-
-        if dist > 1e-6:
-            direction = d / dist
-            stiffness = get_spring_stiffness(spring_type[s])
-            rest_len = spring_lengths[s]
-
-            f_spring = -stiffness * (dist - rest_len) * direction
-
-            ti.atomic_add(force[idx_a], f_spring)
-            ti.atomic_add(force[idx_b], -f_spring)
+    ax.set_xlim(center[0] - radius, center[0] + radius)
+    ax.set_ylim(center[1] - radius, center[1] + radius)
+    ax.set_zlim(center[2] - radius, center[2] + radius)
 
 
-@ti.func
-def clamp_velocity(vel: ti.template(), idx: ti.i32):
+def get_face_colors_from_vertex_scalar(vertex_scalar: np.ndarray, faces: np.ndarray, cmap_name="viridis"):
     """
-    Clamp velocity to avoid numerical explosion.
+    Convert per-vertex scalar values to per-face colors.
     """
-    speed = vel[idx].norm()
+    scalar = vertex_scalar.astype(np.float64)
+    scalar = (scalar - scalar.min()) / (scalar.max() - scalar.min() + 1e-8)
 
-    if speed > max_velocity[None]:
-        vel[idx] = vel[idx] / speed * max_velocity[None]
+    face_scalar = scalar[faces].mean(axis=1)
+    cmap = plt.get_cmap(cmap_name)
+
+    return cmap(face_scalar)
 
 
-@ti.func
-def solve_sphere_collision(pos: ti.template(), vel: ti.template(), idx: ti.i32):
+def get_face_colors_from_joint_weights(lbs_weights: np.ndarray, faces: np.ndarray):
     """
-    Simple particle-sphere collision.
-    If a particle enters the sphere, project it to the surface
-    and remove inward velocity component.
+    Generate colors for all-joint dominant weight visualization.
+
+    For each face:
+        - Find the dominant joint according to averaged face weights.
+        - Use hue to represent joint id.
+        - Use brightness to represent dominant weight strength.
     """
-    if enable_collision[None] == 1 and is_fixed[idx] == 0:
-        center = sphere_center[0]
-        r = sphere_radius[None]
+    face_weights = lbs_weights[faces].mean(axis=1)
 
-        d = pos[idx] - center
-        dist = d.norm()
+    dominant_joint = np.argmax(face_weights, axis=1)
+    dominant_weight = np.max(face_weights, axis=1)
 
-        if dist < r and dist > 1e-6:
-            n = d / dist
+    num_joints = lbs_weights.shape[1]
+    palette = plt.get_cmap("hsv")(np.linspace(0.0, 1.0, num_joints, endpoint=False))
 
-            # Position projection.
-            pos[idx] = center + n * r
+    face_colors = palette[dominant_joint]
 
-            # Remove inward velocity.
-            vn = vel[idx].dot(n)
-            if vn < 0.0:
-                vel[idx] = vel[idx] - vn * n
+    strength = 0.35 + 0.65 * dominant_weight
+    face_colors[:, :3] *= strength[:, None]
+    face_colors[:, :3] += (1.0 - strength[:, None]) * 0.88
+    face_colors[:, 3] = 1.0
 
-            # Slight tangential damping.
-            vel[idx] *= 0.98
+    return face_colors
 
 
-# ============================================================
-# Integration Kernels
-# ============================================================
-
-@ti.kernel
-def step_explicit():
+def smpl_to_plot_coords(points: np.ndarray):
     """
-    Explicit Euler:
-    x_{t+1} = x_t + v_t dt
-    v_{t+1} = v_t + a_t dt
+    Convert SMPL coordinates to plotting coordinates.
+
+    Matplotlib 3D display usually looks better if we swap Y and Z:
+        [x, y, z] -> [x, z, y]
     """
-    compute_forces_on(x, v, f)
-
-    for i in range(NUM_PARTICLES):
-        if is_fixed[i] == 0:
-            x[i] += v[i] * dt
-            v[i] += (f[i] / mass) * dt
-
-            clamp_velocity(v, i)
-            solve_sphere_collision(x, v, i)
+    return points[:, [0, 2, 1]]
 
 
-@ti.kernel
-def step_semi_implicit():
+def shade_face_colors(vertices: np.ndarray, faces: np.ndarray, face_colors: np.ndarray):
     """
-    Semi-Implicit Euler:
-    v_{t+1} = v_t + a_t dt
-    x_{t+1} = x_t + v_{t+1} dt
+    Apply simple Lambert-like shading to face colors.
     """
-    compute_forces_on(x, v, f)
+    triangles = vertices[faces]
 
-    for i in range(NUM_PARTICLES):
-        if is_fixed[i] == 0:
-            v[i] += (f[i] / mass) * dt
-            clamp_velocity(v, i)
-
-            x[i] += v[i] * dt
-            solve_sphere_collision(x, v, i)
-
-
-@ti.kernel
-def step_implicit_iter():
-    """
-    Implicit Euler approximated by fixed-point iterations:
-    v_{t+1} = v_t + a(x_{t+1}, v_{t+1}) dt
-    x_{t+1} = x_t + v_{t+1} dt
-    """
-    # Copy current state to predicted state.
-    for i in range(NUM_PARTICLES):
-        x_next[i] = x[i]
-        v_next[i] = v[i]
-
-    # Fixed-point iterations.
-    for _ in ti.static(range(5)):
-        compute_forces_on(x_next, v_next, f_next)
-
-        for i in range(NUM_PARTICLES):
-            if is_fixed[i] == 0:
-                v_next[i] = v[i] + (f_next[i] / mass) * dt
-                clamp_velocity(v_next, i)
-
-                x_next[i] = x[i] + v_next[i] * dt
-                solve_sphere_collision(x_next, v_next, i)
-
-    # Write back.
-    for i in range(NUM_PARTICLES):
-        if is_fixed[i] == 0:
-            x[i] = x_next[i]
-            v[i] = v_next[i]
-        else:
-            v[i] = ti.Vector([0.0, 0.0, 0.0])
-
-
-# ============================================================
-# GUI Helper
-# ============================================================
-
-def draw_gui(window, state):
-    """
-    Python-side GUI panel.
-    """
-    window.GUI.begin("Control Panel", 0.02, 0.02, 0.42, 0.56)
-
-    window.GUI.text("Mass-Spring Cloth Simulation")
-    window.GUI.text("")
-
-    window.GUI.text("Integration Method:")
-
-    prefix_0 = "[*] " if state["method"] == 0 else "[ ] "
-    prefix_1 = "[*] " if state["method"] == 1 else "[ ] "
-    prefix_2 = "[*] " if state["method"] == 2 else "[ ] "
-
-    if window.GUI.button(prefix_0 + "Explicit Euler"):
-        state["method"] = 0
-        init_cloth()
-
-    if window.GUI.button(prefix_1 + "Semi-Implicit Euler"):
-        state["method"] = 1
-        init_cloth()
-
-    if window.GUI.button(prefix_2 + "Implicit Euler"):
-        state["method"] = 2
-        init_cloth()
-
-    window.GUI.text("")
-
-    pause_label = "Resume Simulation" if state["paused"] else "Pause Simulation"
-    if window.GUI.button(pause_label):
-        state["paused"] = not state["paused"]
-
-    if window.GUI.button("Reset Cloth"):
-        init_cloth()
-
-    window.GUI.text("")
-
-    if window.GUI.button("Toggle Shear Springs"):
-        enable_shear[None] = 1 - enable_shear[None]
-        init_cloth()
-
-    if window.GUI.button("Toggle Bending Springs"):
-        enable_bending[None] = 1 - enable_bending[None]
-        init_cloth()
-
-    if window.GUI.button("Toggle Sphere Collision"):
-        enable_collision[None] = 1 - enable_collision[None]
-
-    window.GUI.text("")
-
-    # GUI sliders.
-    damping = window.GUI.slider_float("Damping", k_d[None], 0.0, 10.0)
-    stiffness = window.GUI.slider_float("Stiffness", k_s[None], 1000.0, 20000.0)
-    max_v = window.GUI.slider_float("Max Velocity", max_velocity[None], 5.0, 100.0)
-
-    k_d[None] = damping
-    k_s[None] = stiffness
-    max_velocity[None] = max_v
-
-    window.GUI.text("")
-    window.GUI.text(f"Shear Springs: {'ON' if enable_shear[None] == 1 else 'OFF'}")
-    window.GUI.text(f"Bending Springs: {'ON' if enable_bending[None] == 1 else 'OFF'}")
-    window.GUI.text(f"Sphere Collision: {'ON' if enable_collision[None] == 1 else 'OFF'}")
-    window.GUI.text(f"Spring Count: {num_springs[None]}")
-
-    window.GUI.end()
-
-
-# ============================================================
-# Main Application
-# ============================================================
-
-def main():
-    init_global_params()
-    init_cloth()
-
-    window = ti.ui.Window(
-        "CG Lab 7 - Mass Spring Cloth Model",
-        (1024, 768),
-        vsync=True,
+    normals = np.cross(
+        triangles[:, 1] - triangles[:, 0],
+        triangles[:, 2] - triangles[:, 0]
     )
 
-    canvas = window.get_canvas()
-    scene = window.get_scene()
-    camera = ti.ui.Camera()
+    normals /= np.linalg.norm(normals, axis=1, keepdims=True) + 1e-8
 
-    camera.position(0.0, 0.35, 2.2)
-    camera.lookat(0.0, 0.15, 0.0)
+    light_dir = np.array([-0.25, -0.55, 0.80], dtype=np.float64)
+    light_dir /= np.linalg.norm(light_dir)
 
-    state = {
-        "method": 1,   # 0 explicit, 1 semi-implicit, 2 implicit
-        "paused": False,
+    intensity = 0.35 + 0.65 * np.clip(normals @ light_dir, 0.0, 1.0)
+
+    shaded = face_colors.copy()
+    shaded[:, :3] *= intensity[:, None]
+
+    return shaded
+
+
+# ============================================================
+# Visualization functions
+# ============================================================
+
+def draw_mesh(
+    ax,
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    joints: np.ndarray = None,
+    vertex_scalar: np.ndarray = None,
+    face_colors: np.ndarray = None,
+    title: str = "",
+    elev: float = 12,
+    azim: float = 108,
+):
+    """
+    Draw a mesh using matplotlib 3D Poly3DCollection.
+    """
+    plot_vertices = smpl_to_plot_coords(vertices)
+    plot_joints = None if joints is None else smpl_to_plot_coords(joints)
+
+    if face_colors is not None:
+        face_colors = face_colors.copy()
+    elif vertex_scalar is None:
+        face_colors = np.tile(
+            np.array([[0.82, 0.67, 0.52, 1.0]]),
+            (faces.shape[0], 1)
+        )
+    else:
+        face_colors = get_face_colors_from_vertex_scalar(vertex_scalar, faces)
+
+    face_colors = shade_face_colors(plot_vertices, faces, face_colors)
+
+    mesh = Poly3DCollection(
+        plot_vertices[faces],
+        facecolors=face_colors,
+        linewidths=0.03,
+        edgecolors=(0.0, 0.0, 0.0, 0.05),
+    )
+
+    ax.add_collection3d(mesh)
+
+    if joints is not None:
+        ax.scatter(
+            plot_joints[:, 0],
+            plot_joints[:, 1],
+            plot_joints[:, 2],
+            c="white",
+            s=12,
+            depthshade=False,
+            edgecolors="black",
+            linewidths=0.3,
+        )
+
+    set_axes_equal(ax, plot_vertices)
+
+    try:
+        ax.set_proj_type("persp", focal_length=0.85)
+    except TypeError:
+        ax.set_proj_type("persp")
+
+    ax.view_init(elev=elev, azim=azim)
+    ax.set_axis_off()
+    ax.set_title(title, fontsize=10)
+
+
+def save_single_figure(
+    path,
+    vertices,
+    faces,
+    joints=None,
+    vertex_scalar=None,
+    title="",
+):
+    """
+    Save one mesh visualization.
+    """
+    fig = plt.figure(figsize=(5, 6))
+    ax = fig.add_subplot(111, projection="3d")
+
+    draw_mesh(
+        ax,
+        vertices,
+        faces,
+        joints=joints,
+        vertex_scalar=vertex_scalar,
+        title=title,
+    )
+
+    fig.tight_layout()
+    fig.savefig(path, dpi=220, bbox_inches="tight")
+    plt.close(fig)
+
+
+def save_comparison_grid(path, data_dict, faces):
+    """
+    Save a 2x2 comparison grid for four LBS stages.
+    """
+    fig = plt.figure(figsize=(14, 10))
+
+    ax1 = fig.add_subplot(221, projection="3d")
+    draw_mesh(
+        ax1,
+        data_dict["v_template"],
+        faces,
+        joints=data_dict["J_template"],
+        vertex_scalar=data_dict["weight_scalar"],
+        title="(a) Template + LBS Weights",
+    )
+
+    ax2 = fig.add_subplot(222, projection="3d")
+    draw_mesh(
+        ax2,
+        data_dict["v_shaped"],
+        faces,
+        joints=data_dict["J_shaped"],
+        title="(b) Shape Blend + Joint Regression",
+    )
+
+    ax3 = fig.add_subplot(223, projection="3d")
+    draw_mesh(
+        ax3,
+        data_dict["v_posed"],
+        faces,
+        joints=data_dict["J_shaped"],
+        vertex_scalar=data_dict["pose_offset_norm"],
+        title="(c) Pose Blend Shapes",
+    )
+
+    ax4 = fig.add_subplot(224, projection="3d")
+    draw_mesh(
+        ax4,
+        data_dict["verts"],
+        faces,
+        joints=data_dict["J_transformed"],
+        title="(d) Final LBS Result",
+    )
+
+    fig.tight_layout()
+    fig.savefig(path, dpi=220, bbox_inches="tight")
+    plt.close(fig)
+
+
+def save_all_joint_weights_figure(path, vertices, faces, joints, lbs_weights):
+    """
+    Save all-joint dominant weight distribution visualization.
+    """
+    fig = plt.figure(figsize=(7, 8))
+    ax = fig.add_subplot(111, projection="3d")
+
+    draw_mesh(
+        ax,
+        vertices,
+        faces,
+        joints=joints,
+        face_colors=get_face_colors_from_joint_weights(lbs_weights, faces),
+        title="All Joint LBS Weights",
+    )
+
+    fig.tight_layout()
+    fig.savefig(path, dpi=220, bbox_inches="tight")
+    plt.close(fig)
+
+
+# ============================================================
+# Demo shape and pose
+# ============================================================
+
+def build_demo_shape(device, dtype, num_betas=10):
+    """
+    Build non-zero beta values to make shape change visible.
+    """
+    betas = torch.zeros((1, num_betas), dtype=dtype, device=device)
+
+    if num_betas >= 1:
+        betas[0, 0] = 2.0
+    if num_betas >= 2:
+        betas[0, 1] = -1.2
+    if num_betas >= 3:
+        betas[0, 2] = 0.8
+
+    return betas
+
+
+def build_demo_pose(device, dtype):
+    """
+    Build a simple non-zero SMPL pose.
+
+    SMPL:
+        global_orient: [1, 3]
+        body_pose: [1, 23 * 3]
+
+    Joint index follows SMPL 24-joint convention:
+        0 pelvis
+        1 left_hip
+        2 right_hip
+        3 spine1
+        4 left_knee
+        5 right_knee
+        ...
+        16 left_shoulder
+        17 right_shoulder
+        18 left_elbow
+        19 right_elbow
+    """
+    global_orient = torch.zeros((1, 3), dtype=dtype, device=device)
+    body_pose = torch.zeros((1, 23 * 3), dtype=dtype, device=device)
+
+    joint_names = {
+        "left_hip": 1,
+        "right_hip": 2,
+        "left_knee": 4,
+        "right_knee": 5,
+        "left_shoulder": 16,
+        "right_shoulder": 17,
+        "left_elbow": 18,
+        "right_elbow": 19,
     }
 
-    while window.running:
-        draw_gui(window, state)
+    def set_joint_pose(name, axis_angle):
+        # body_pose excludes global joint 0, so subtract 1
+        start = (joint_names[name] - 1) * 3
+        body_pose[0, start:start + 3] = torch.tensor(axis_angle, dtype=dtype, device=device)
 
-        if not state["paused"]:
-            # More substeps improve stability.
-            for _ in range(35):
-                if state["method"] == 0:
-                    step_explicit()
-                elif state["method"] == 1:
-                    step_semi_implicit()
-                else:
-                    step_implicit_iter()
+    # Arms
+    set_joint_pose("left_shoulder", [0.0, 0.0, 0.45])
+    set_joint_pose("right_shoulder", [0.0, 0.0, -0.45])
+    set_joint_pose("left_elbow", [0.0, -0.35, 0.0])
+    set_joint_pose("right_elbow", [0.0, 0.35, 0.0])
 
-        camera.track_user_inputs(
-            window,
-            movement_speed=0.03,
-            hold_key=ti.ui.RMB,
+    # Legs
+    set_joint_pose("left_hip", [0.25, 0.0, 0.08])
+    set_joint_pose("right_hip", [-0.18, 0.0, -0.08])
+    set_joint_pose("left_knee", [0.35, 0.0, 0.0])
+    set_joint_pose("right_knee", [0.20, 0.0, 0.0])
+
+    return global_orient, body_pose
+
+
+# ============================================================
+# Manual LBS
+# ============================================================
+
+def prepare_posedirs(posedirs: torch.Tensor, expected_pose_dim: int):
+    """
+    Different SMPL/SMPL-X implementations may store posedirs as:
+        [P, V * 3]
+    or transposed form:
+        [V * 3, P]
+
+    Official lbs() expects:
+        [P, V * 3]
+    """
+    if posedirs.dim() != 2:
+        posedirs = posedirs.reshape(posedirs.shape[0], -1)
+
+    if posedirs.shape[0] == expected_pose_dim:
+        return posedirs
+
+    if posedirs.shape[1] == expected_pose_dim:
+        return posedirs.T
+
+    raise RuntimeError(
+        f"posedirs shape does not match pose_feature. "
+        f"posedirs.shape={tuple(posedirs.shape)}, "
+        f"expected_pose_dim={expected_pose_dim}"
+    )
+
+
+def compute_manual_lbs(model, betas, global_orient, body_pose):
+    """
+    Manually reproduce key stages of SMPL LBS:
+
+        1. v_template
+        2. v_shaped = v_template + B_S(beta)
+        3. J = J_regressor(v_shaped)
+        4. v_posed = v_shaped + B_P(theta)
+        5. verts = LBS(v_posed, J, theta, weights)
+
+    Return all important intermediate variables for visualization.
+    """
+    device = betas.device
+    dtype = betas.dtype
+
+    # ------------------------------------------------------------
+    # (a) Template mesh
+    # ------------------------------------------------------------
+    v_template = model.v_template
+
+    if v_template.dim() == 2:
+        v_template = v_template.unsqueeze(0)
+
+    # ------------------------------------------------------------
+    # (b) Shape blend shape and joint regression
+    # ------------------------------------------------------------
+    shapedirs = model.shapedirs[:, :, :betas.shape[1]]
+    v_shaped = v_template + blend_shapes(betas, shapedirs)
+
+    J = vertices2joints(model.J_regressor, v_shaped)
+
+    # ------------------------------------------------------------
+    # (c) Pose corrective blend shape
+    # ------------------------------------------------------------
+    full_pose = torch.cat([global_orient, body_pose], dim=1)
+
+    rot_mats = batch_rodrigues(full_pose.view(-1, 3)).view(1, -1, 3, 3)
+
+    ident = torch.eye(3, dtype=dtype, device=device)
+    pose_feature = (rot_mats[:, 1:, :, :] - ident).view(1, -1)
+
+    posedirs = prepare_posedirs(model.posedirs, expected_pose_dim=pose_feature.shape[1])
+
+    pose_offsets = torch.matmul(pose_feature, posedirs).view(1, -1, 3)
+    v_posed = v_shaped + pose_offsets
+
+    # ------------------------------------------------------------
+    # (d) Rigid transform and Linear Blend Skinning
+    # ------------------------------------------------------------
+    J_transformed, A = batch_rigid_transform(
+        rot_mats,
+        J,
+        model.parents,
+        dtype=dtype,
+    )
+
+    num_joints = J.shape[1]
+
+    W = model.lbs_weights.unsqueeze(0).expand(1, -1, -1)
+
+    T = torch.matmul(
+        W,
+        A.view(1, num_joints, 16)
+    ).view(1, -1, 4, 4)
+
+    homogen_coord = torch.ones(
+        (1, v_posed.shape[1], 1),
+        dtype=dtype,
+        device=device,
+    )
+
+    v_posed_homo = torch.cat([v_posed, homogen_coord], dim=2)
+    v_homo = torch.matmul(T, v_posed_homo.unsqueeze(-1))
+
+    verts = v_homo[:, :, :3, 0]
+
+    # Template joints for stage (a) visualization
+    J_template = vertices2joints(model.J_regressor, v_template)
+
+    return {
+        "v_template": v_template,
+        "J_template": J_template,
+        "v_shaped": v_shaped,
+        "J_shaped": J,
+        "pose_offsets": pose_offsets,
+        "v_posed": v_posed,
+        "J_transformed": J_transformed,
+        "verts": verts,
+    }
+
+
+def compare_with_official_forward(model, betas, global_orient, body_pose, manual_verts):
+    """
+    Compare manually computed LBS vertices with official SMPL forward vertices.
+    """
+    with torch.no_grad():
+        output = model(
+            betas=betas,
+            global_orient=global_orient,
+            body_pose=body_pose,
+            return_verts=True,
         )
 
-        scene.set_camera(camera)
-        scene.ambient_light((0.45, 0.45, 0.45))
-        scene.point_light(pos=(0.5, 1.5, 1.5), color=(1.0, 1.0, 1.0))
-        scene.point_light(pos=(-0.8, 1.2, 0.8), color=(0.6, 0.6, 0.7))
+    official_verts = output.vertices
 
-        # Draw collision sphere.
-        # The color is darker to avoid visually covering the blue cloth too much.
-        if enable_collision[None] == 1:
-            scene.particles(
-                sphere_center,
-                radius=sphere_radius[None],
-                color=(0.75, 0.35, 0.20),
-            )
+    diff = torch.abs(manual_verts - official_verts)
 
-        # Draw cloth particles.
-        # Larger blue particles make the cloth visually clearer in GIF.
-        scene.particles(
-            x,
-            radius=0.014,
-            color=(0.05, 0.45, 1.0),
+    mean_err = diff.mean().item()
+    max_err = diff.max().item()
+
+    return mean_err, max_err
+
+
+# ============================================================
+# Main
+# ============================================================
+
+def main(args):
+    device = torch.device(args.device)
+    dtype = torch.float32
+
+    model_dir = resolve_project_path(args.model_dir)
+    out_dir = resolve_project_path(args.out_dir)
+
+    make_out_dir(out_dir)
+
+    print("Project root:", PROJECT_ROOT)
+    print("Model dir:", model_dir)
+    print("Output dir:", out_dir)
+
+    # ------------------------------------------------------------
+    # Load SMPL model
+    # ------------------------------------------------------------
+    install_chumpy_pickle_shim()
+
+    model = smplx.create(
+        model_path=model_dir,
+        model_type="smpl",
+        gender="neutral",
+        ext="pkl",
+        num_betas=args.num_betas,
+    ).to(device)
+
+    model.eval()
+
+    faces = np.asarray(model.faces, dtype=np.int32)
+
+    num_vertices = model.v_template.shape[0]
+    num_faces = faces.shape[0]
+    num_joints = model.lbs_weights.shape[1]
+
+    # ------------------------------------------------------------
+    # Build demo parameters
+    # ------------------------------------------------------------
+    betas = build_demo_shape(device, dtype, num_betas=args.num_betas)
+    global_orient, body_pose = build_demo_pose(device, dtype)
+
+    # ------------------------------------------------------------
+    # Manual LBS
+    # ------------------------------------------------------------
+    data = compute_manual_lbs(
+        model,
+        betas,
+        global_orient,
+        body_pose,
+    )
+
+    # ------------------------------------------------------------
+    # Official forward comparison
+    # ------------------------------------------------------------
+    mean_err, max_err = compare_with_official_forward(
+        model,
+        betas,
+        global_orient,
+        body_pose,
+        data["verts"],
+    )
+
+    # ------------------------------------------------------------
+    # Prepare visualization data
+    # ------------------------------------------------------------
+    joint_id = int(args.joint_id)
+
+    if joint_id < 0 or joint_id >= model.lbs_weights.shape[1]:
+        raise ValueError(
+            f"joint_id out of range: {joint_id}. "
+            f"Valid range: [0, {model.lbs_weights.shape[1] - 1}]"
         )
 
-        # Draw spring lines.
-        # Brighter and thicker lines make the cloth grid easier to observe.
-        scene.lines(
-            x,
-            indices=spring_indices,
-            width=1.8,
-            color=(0.95, 0.95, 0.95),
-        )
+    weight_scalar = to_numpy(model.lbs_weights[:, joint_id])
+    pose_offset_norm = np.linalg.norm(to_numpy(data["pose_offsets"][0]), axis=1)
 
-        canvas.scene(scene)
-        window.show()
+    # ------------------------------------------------------------
+    # Save stage figures
+    # ------------------------------------------------------------
+    save_single_figure(
+        os.path.join(out_dir, "stage_a_template_weights.png"),
+        to_numpy(data["v_template"][0]),
+        faces,
+        joints=to_numpy(data["J_template"][0]),
+        vertex_scalar=weight_scalar,
+        title=f"(a) Template Mesh + Weight of Joint {joint_id}",
+    )
+
+    save_single_figure(
+        os.path.join(out_dir, "stage_b_shaped_joints.png"),
+        to_numpy(data["v_shaped"][0]),
+        faces,
+        joints=to_numpy(data["J_shaped"][0]),
+        vertex_scalar=None,
+        title="(b) Shape Blend + Joint Regression",
+    )
+
+    save_single_figure(
+        os.path.join(out_dir, "stage_c_pose_offsets.png"),
+        to_numpy(data["v_posed"][0]),
+        faces,
+        joints=to_numpy(data["J_shaped"][0]),
+        vertex_scalar=pose_offset_norm,
+        title="(c) Pose Blend Shapes colored by |pose_offsets|",
+    )
+
+    save_single_figure(
+        os.path.join(out_dir, "stage_d_lbs_result.png"),
+        to_numpy(data["verts"][0]),
+        faces,
+        joints=to_numpy(data["J_transformed"][0]),
+        vertex_scalar=None,
+        title="(d) Final LBS Result",
+    )
+
+    # ------------------------------------------------------------
+    # Save comparison grid
+    # ------------------------------------------------------------
+    grid_dict = {
+        "v_template": to_numpy(data["v_template"][0]),
+        "J_template": to_numpy(data["J_template"][0]),
+        "v_shaped": to_numpy(data["v_shaped"][0]),
+        "J_shaped": to_numpy(data["J_shaped"][0]),
+        "v_posed": to_numpy(data["v_posed"][0]),
+        "verts": to_numpy(data["verts"][0]),
+        "J_transformed": to_numpy(data["J_transformed"][0]),
+        "weight_scalar": weight_scalar,
+        "pose_offset_norm": pose_offset_norm,
+    }
+
+    save_comparison_grid(
+        os.path.join(out_dir, "comparison_grid.png"),
+        grid_dict,
+        faces,
+    )
+
+    # ------------------------------------------------------------
+    # Save optional all-joint dominant weight figure
+    # ------------------------------------------------------------
+    save_all_joint_weights_figure(
+        os.path.join(out_dir, "all_joint_weights.png"),
+        to_numpy(data["v_template"][0]),
+        faces,
+        to_numpy(data["J_template"][0]),
+        to_numpy(model.lbs_weights),
+    )
+
+    # ------------------------------------------------------------
+    # Save summary.txt
+    # ------------------------------------------------------------
+    summary_path = os.path.join(out_dir, "summary.txt")
+
+    with open(summary_path, "w", encoding="utf-8") as f:
+        f.write("===== SMPL LBS Lab Summary =====\n")
+        f.write(f"num_vertices: {num_vertices}\n")
+        f.write(f"num_faces: {num_faces}\n")
+        f.write(f"num_joints(from lbs_weights): {num_joints}\n")
+        f.write(f"num_betas: {args.num_betas}\n")
+        f.write(f"visualized_joint_id: {joint_id}\n")
+        f.write(f"manual_vs_official_mean_abs_error: {mean_err:.10f}\n")
+        f.write(f"manual_vs_official_max_abs_error: {max_err:.10f}\n")
+        f.write("\n")
+        f.write("Generated files:\n")
+        f.write("stage_a_template_weights.png\n")
+        f.write("stage_b_shaped_joints.png\n")
+        f.write("stage_c_pose_offsets.png\n")
+        f.write("stage_d_lbs_result.png\n")
+        f.write("comparison_grid.png\n")
+        f.write("all_joint_weights.png\n")
+
+    # ------------------------------------------------------------
+    # Print summary
+    # ------------------------------------------------------------
+    print("")
+    print("运行完成。")
+    print(f"顶点数: {num_vertices}")
+    print(f"面片数: {num_faces}")
+    print(f"关节数: {num_joints}")
+    print(f"betas 维度: {args.num_betas}")
+    print(f"可视化关节 ID: {joint_id}")
+    print(f"手写 LBS 与官方 forward 的平均绝对误差: {mean_err:.10f}")
+    print(f"手写 LBS 与官方 forward 的最大绝对误差: {max_err:.10f}")
+    print(f"结果已保存到: {out_dir}")
+    print("")
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="Lab 8: SMPL Linear Blend Skinning Visualization")
+
+    parser.add_argument(
+        "--model-dir",
+        type=str,
+        default="./models",
+        help="SMPL model directory. It should contain smpl/SMPL_NEUTRAL.pkl",
+    )
+
+    parser.add_argument(
+        "--out-dir",
+        type=str,
+        default="./outputs",
+        help="Output directory",
+    )
+
+    parser.add_argument(
+        "--joint-id",
+        type=int,
+        default=18,
+        help="Joint id for single-joint LBS weight visualization",
+    )
+
+    parser.add_argument(
+        "--num-betas",
+        type=int,
+        default=10,
+        help="Number of SMPL shape parameters",
+    )
+
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="cpu",
+        choices=["cpu", "cuda"],
+        help="Device to run the experiment",
+    )
+
+    args = parser.parse_args()
+    main(args)
